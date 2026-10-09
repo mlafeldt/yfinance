@@ -505,10 +505,13 @@ class TestTickerEarningsDatesParsing(unittest.TestCase):
 class TestTickerNews(unittest.TestCase):
     @staticmethod
     def _fake_post(url, body=None, **kwargs):
-        query_ref = url.split("queryRef=")[1].split("&")[0]
-        count = body["serviceConfig"]["snippetCount"]
-        stream = [{"id": f"{query_ref}-{i}"} for i in range(count)]
-        return MagicMock(text="", json=lambda: {"data": {"tickerStream": {"stream": stream}}})
+        variables = body["variables"]
+        tab = variables["listInput"]["slug"].split("-")[-1]
+        edges = [{"node": {"asset": {"__typename": "Story", "id": f"{tab}-{i}",
+                                     "contentAttributes": {"canonicalUrl": "https://finance.yahoo.com/news/story.html"}}}}
+                 for i in range(variables["first"])]
+        page = {"pageInfo": {"hasNextPage": False}, "edges": edges}
+        return MagicMock(status_code=200, json=lambda: {"data": {"lightyearList": {"main": page}}})
 
     def test_news_cached_per_count_and_tab(self):
         with patch("yfinance.data.YfData.post", side_effect=self._fake_post):
@@ -517,8 +520,8 @@ class TestTickerNews(unittest.TestCase):
             press = ticker.get_news(count=5, tab="press releases")
             news_again = ticker.get_news(count=2, tab="news")
 
-        self.assertEqual([a["id"] for a in news], ["latestNews-0", "latestNews-1"])
-        self.assertEqual([a["id"] for a in press], [f"pressRelease-{i}" for i in range(5)])
+        self.assertEqual([a["id"] for a in news], ["news-0", "news-1"])
+        self.assertEqual([a["id"] for a in press], [f"pressrelease-{i}" for i in range(5)])
         self.assertIs(news_again, news, "data not cached")
 
     def test_news_invalid_tab_raises_after_cached_call(self):
