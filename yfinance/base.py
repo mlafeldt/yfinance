@@ -34,7 +34,7 @@ from . import utils, cache
 from .const import _MIC_TO_YAHOO_SUFFIX, _SENTINEL_
 from .data import YfData
 from .config import YfConfig
-from .exceptions import YFDataException, YFEarningsDateMissing, YFRateLimitError
+from .exceptions import YFEarningsDateMissing, YFRateLimitError
 from .live import WebSocket
 from .scrapers.analysis import Analysis
 from .scrapers.fundamentals import Fundamentals
@@ -42,8 +42,9 @@ from .scrapers.holders import Holders
 from .scrapers.quote import Quote, FastInfo
 from .scrapers.history import PriceHistory
 from .scrapers.funds import FundsData
+from .scrapers.news import fetch_news
 
-from .const import _BASE_URL_, _QUERY1_URL_, _CONTENT_GATEWAY_URL_
+from .const import _BASE_URL_, _QUERY1_URL_
 
 from io import StringIO
 from bs4 import BeautifulSoup
@@ -51,35 +52,6 @@ from bs4 import BeautifulSoup
 
 _tz_info_fetch_ctr = 0
 
-# Ticker news query for Yahoo's content gateway, as used by the quote page.
-# Aliases match the field names of the retired /xhr/ncp endpoint. Keep
-# clickthroughUrl: without a field using $clientContext, every asset comes back
-# as AssetError.
-_NEWS_QUERY = """
-query($listInput: LightyearListInput!, $clientContext: ClientContext!, $mlRecsInput: MLRecsInput!, $first: Int, $after: String) {
-  lightyearList: financeTickerList(list_input: $listInput, cc: $clientContext) {
-    main: mlRecsStream(mlRecsInput: $mlRecsInput, first: $first, after: $after) {
-      pageInfo { hasNextPage endCursor }
-      edges { node { ... on AssetRef { asset {
-        __typename
-        ... on Story { id: uuid title contentAttributes { ...Attrs } finance { stockTickers { symbol } } }
-        ... on Video { id: uuid title contentAttributes { ...Attrs } finance { stockTickers { symbol } } }
-      } } } }
-    }
-  }
-}
-fragment Attrs on ContentAttributes {
-  description summary pubDate: publishTime displayTime isHosted canonicalUrl
-  clickthroughUrl(cc: $clientContext)
-  provider { displayName url sourceId: providerId }
-  thumbnail {
-    originalUrl: url originalWidth: width originalHeight: height
-    resolutions: resized(resizeInput: [{operations: ["resizefill_w170_h128"], transformLabel: "170x128"}]) {
-      url width height tag: transformLabel
-    }
-  }
-}
-"""
 
 class TickerBase:
     def __init__(self, ticker, session=None):
@@ -644,100 +616,13 @@ class TickerBase:
 
     def get_news(self, count=10, tab="news") -> list:
         """Allowed options for tab: "news", "all", "press releases"""
-        logger = utils.get_yf_logger()
-
-
-        tab_lists = {
-            "all": "finance-US-en-US-ticker-all",
-            "news": "finance-US-en-US-ticker-news",
-            "press releases": "finance-US-en-US-ticker-pressrelease",
-        }
-
-        list_alias = tab_lists.get(tab.lower())
-        if not list_alias:
-            raise ValueError(f"Invalid tab name '{tab}'. Choose from: {', '.join(tab_lists.keys())}")
-
         # Cache per request: a different count or tab is a different result
-        cache_key = (count, list_alias)
+        cache_key = (count, tab.lower())
         if self._news.get(cache_key):
             return self._news[cache_key]
 
-        variables = {
-            "listInput": {
-                "slug": f"list={list_alias}",
-                "getFullList": True,
-                "queryVariables": {"tickerSymbol": [self.ticker]},
-            },
-            "clientContext": {"lang": "en-US", "region": "US", "site": "finance", "device": "desktop"},
-            "mlRecsInput": {
-                "instance": "FINANCE",
-                "count": 200,
-                "rankInput": {"financeQuoteNewsV2": {"tickerSymbol": [self.ticker]}},
-            },
-        }
-
-        # Page through the list: large pages make the gateway fail to resolve
-        # many assets, and unresolvable ones (AssetError) are skipped, so keep
-        # going until enough usable items are collected.
-        news = []
-        after = None
-        while len(news) < count:
-            variables.update(first=min(count - len(news), 50), after=after)
-            response = self._data.post(_CONTENT_GATEWAY_URL_, body={"query": _NEWS_QUERY, "variables": variables},
-                                       headers={"x-yahoo-cg-client-name": "finance"})
-            try:
-                if response.status_code != 200:
-                    raise YFDataException(f"HTTP {response.status_code}: {response.text[:200]}")
-                data = response.json()
-                main = ((data.get("data") or {}).get("lightyearList") or {}).get("main")
-                if main is None:
-                    raise YFDataException(f"unexpected response: {response.text[:200]}")
-            except (YFDataException, ValueError) as e:
-                if not YfConfig.debug.hide_exceptions:
-                    raise YFDataException(f"{self.ticker}: Failed to retrieve news: {e}") from e
-                logger.error(f"{self.ticker}: Failed to retrieve news: {e}")
-                break
-
-            assets = [(edge.get("node") or {}).get("asset") for edge in main.get("edges", [])]
-            news += [item for item in map(self._parse_news_asset, assets) if item]
-
-            page_info = main.get("pageInfo") or {}
-            after = page_info.get("endCursor")
-            if not page_info.get("hasNextPage") or not after:
-                break
-
-        self._news[cache_key] = news[:count]
+        self._news[cache_key] = fetch_news(self._data, self.ticker, count, tab)
         return self._news[cache_key]
-
-    @staticmethod
-    def _parse_news_asset(asset):
-        # Reshape to the item format of the retired /xhr/ncp endpoint, like
-        # Yahoo's own front end does, so existing callers keep working.
-        if not asset or asset.get("__typename") not in ("Story", "Video"):
-            return None
-        attrs = asset.get("contentAttributes") or {}
-        url = attrs.get("canonicalUrl") or attrs.get("clickthroughUrl")
-        if not url:
-            return None
-        clickthrough_url = attrs.get("clickthroughUrl")
-        return {
-            "id": asset["id"],
-            "content": {
-                "id": asset["id"],
-                "contentType": asset["__typename"].upper(),
-                "title": asset.get("title"),
-                "description": attrs.get("description"),
-                "summary": attrs.get("summary"),
-                "pubDate": attrs.get("pubDate"),
-                "displayTime": attrs.get("displayTime"),
-                "isHosted": attrs.get("isHosted"),
-                "provider": attrs.get("provider"),
-                "canonicalUrl": {"url": url},
-                "clickThroughUrl": {"url": clickthrough_url} if clickthrough_url else None,
-                "thumbnail": attrs.get("thumbnail"),
-                "finance": asset.get("finance"),
-            },
-        }
 
     def get_earnings_dates(self, limit = 12, offset = 0) -> Optional[pd.DataFrame]:
         if limit > 100:

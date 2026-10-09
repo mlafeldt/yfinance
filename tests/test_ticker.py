@@ -517,7 +517,7 @@ class TestTickerNews(unittest.TestCase):
             "contentAttributes": {
                 "description": None, "summary": f"Summary {uuid}",
                 "pubDate": "2026-10-09T13:25:39Z", "displayTime": "2026-10-09T13:25:39Z", "isHosted": True,
-                "canonicalUrl": url, "clickthroughUrl": url,
+                "canonicalUrl": url, "clickThroughUrl": url,
                 "provider": {"displayName": "Reuters", "url": "https://www.reuters.com/", "sourceId": "reuters.com"},
                 "thumbnail": None,
             },
@@ -535,11 +535,10 @@ class TestTickerNews(unittest.TestCase):
         return response
 
     def _news_with_mock(self, responses, **kwargs):
-        # Record each request's variables: get_news mutates one dict between pages.
         requests = []
 
         def fake_post(url, body=None, headers=None, **_):
-            requests.append({"url": url, "headers": headers, "variables": json.loads(json.dumps(body["variables"]))})
+            requests.append({"url": url, "headers": headers, "variables": body["variables"]})
             return responses.pop(0)
 
         with patch("yfinance.data.YfData.post", side_effect=fake_post):
@@ -583,6 +582,28 @@ class TestTickerNews(unittest.TestCase):
         self.assertEqual(requests[0]["headers"], {"x-yahoo-cg-client-name": "finance"})
         self.assertEqual(requests[0]["variables"]["listInput"]["slug"], "list=finance-US-en-US-ticker-news")
         self.assertEqual(requests[0]["variables"]["listInput"]["queryVariables"]["tickerSymbol"], ["AAPL"])
+
+    def test_news_preserves_content_attributes(self):
+        story = self._story("a")
+        story["contentAttributes"]["newField"] = {"value": "from the query"}
+        news, _ = self._news_with_mock([self._page([story])])
+        self.assertEqual(news[0]["content"]["newField"], {"value": "from the query"})
+        self.assertEqual(story["contentAttributes"]["canonicalUrl"], "https://finance.yahoo.com/news/story.html")
+
+    def test_news_url_wrapping(self):
+        for asset_type in ("Story", "Video"):
+            for canonical_url, clickthrough_url in (("https://example.com/story", None),
+                                                   (None, "https://example.com/click"),
+                                                   ("https://example.com/story", "https://example.com/click")):
+                with self.subTest(asset_type=asset_type, canonical_url=canonical_url, clickthrough_url=clickthrough_url):
+                    asset = self._story("a")
+                    asset["__typename"] = asset_type
+                    asset["contentAttributes"].update(canonicalUrl=canonical_url, clickThroughUrl=clickthrough_url)
+                    news, _ = self._news_with_mock([self._page([asset])])
+                    content = news[0]["content"]
+                    self.assertEqual(content["contentType"], asset_type.upper())
+                    self.assertEqual(content["canonicalUrl"], {"url": canonical_url or clickthrough_url})
+                    self.assertEqual(content["clickThroughUrl"], {"url": clickthrough_url} if clickthrough_url else None)
 
     def test_news_skips_unusable_assets(self):
         assets = [{"__typename": "AssetError"}, None, {"__typename": "Outlink", "uuid": "x"},
