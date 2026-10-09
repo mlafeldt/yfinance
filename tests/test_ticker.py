@@ -624,6 +624,28 @@ class TestTickerNews(unittest.TestCase):
         self.assertEqual([item["id"] for item in news], ["a"])
         self.assertEqual(len(requests), 1)
 
+    def test_news_large_count(self):
+        assets = [self._story(str(i)) for i in range(230)]
+
+        def fake_post(url, body=None, **_):
+            variables = body["variables"]
+            stream_end = min(len(assets), variables["mlRecsInput"]["count"])
+            start = int(variables["after"] or 0)
+            end = min(start + variables["first"], stream_end)
+            return self._page(assets[start:end], end_cursor=str(end) if end < stream_end else None)
+
+        with patch("yfinance.data.YfData.post", side_effect=fake_post) as post:
+            news = yf.Ticker("AAPL").get_news(count=205)
+
+        self.assertEqual([item["id"] for item in news], [str(i) for i in range(205)])
+        self.assertEqual([call.kwargs["body"]["variables"]["first"] for call in post.call_args_list],
+                         [50, 50, 50, 50, 5])
+
+    def test_news_limits_oversized_response(self):
+        news, requests = self._news_with_mock([self._page([self._story("a"), self._story("b")])], count=1)
+        self.assertEqual([item["id"] for item in news], ["a"])
+        self.assertEqual(requests[0]["variables"]["first"], 1)
+
     def test_news_http_error(self):
         response = MagicMock()
         response.status_code = 404
@@ -634,6 +656,30 @@ class TestTickerNews(unittest.TestCase):
         YfConfig.debug.hide_exceptions = False
         with self.assertRaises(YFDataException):
             self._news_with_mock([response])
+
+    def test_news_retains_items_on_later_page_error(self):
+        response = MagicMock()
+        response.status_code = 500
+        response.text = "Internal Server Error"
+        pages = [self._page([self._story("a")], end_cursor="c1"), response]
+        news, _ = self._news_with_mock(pages, count=3)
+        self.assertEqual([item["id"] for item in news], ["a"])
+
+        YfConfig.debug.hide_exceptions = False
+        with self.assertRaisesRegex(YFDataException, "AAPL: Failed to retrieve news: HTTP 500"):
+            self._news_with_mock([self._page([self._story("a")], end_cursor="c1"), response], count=3)
+
+    def test_news_invalid_json(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.text = "not JSON"
+        response.json.side_effect = ValueError("invalid JSON")
+        self.assertEqual(self._news_with_mock([response])[0], [])
+
+        YfConfig.debug.hide_exceptions = False
+        with self.assertRaisesRegex(YFDataException, "AAPL: Failed to retrieve news: invalid JSON") as raised:
+            self._news_with_mock([response])
+        self.assertIsInstance(raised.exception.__cause__, ValueError)
 
     def test_news_graphql_error(self):
         response = MagicMock()

@@ -14,6 +14,10 @@ _TAB_LISTS = {
 # Larger pages make the gateway fail to resolve many assets (AssetError).
 _MAX_PAGE_SIZE = 50
 
+# Yahoo's quote page uses 200 ranked candidates. This pool caps the entire
+# stream, independently of each page's `first`, so it must be at least `count`.
+_MIN_CANDIDATE_COUNT = 200
+
 # Ticker news query for Yahoo's content gateway, as used by the quote page.
 # Aliases match the field names of the retired /xhr/ncp endpoint. Keep
 # clickthroughUrl: without a field using $clientContext, every asset comes back
@@ -60,7 +64,7 @@ def fetch_news(data: YfData, symbol: str, count: int, tab: str) -> list:
         "clientContext": {"lang": "en-US", "region": "US", "site": "finance", "device": "desktop"},
         "mlRecsInput": {
             "instance": "FINANCE",
-            "count": 200,
+            "count": max(count, _MIN_CANDIDATE_COUNT),
             "rankInput": {"financeQuoteNewsV2": {"tickerSymbol": [symbol]}},
         },
     }
