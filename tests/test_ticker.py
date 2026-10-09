@@ -503,15 +503,126 @@ class TestTickerEarningsDatesParsing(unittest.TestCase):
         self.assertEqual([str(d.date()) for d in df.index], ["2025-10-20", "2025-04-24", "2025-01-29"])
 
 class TestTickerNews(unittest.TestCase):
+
+    # get_news() queries Yahoo's content gateway (GraphQL) and reshapes each
+    # asset into the item format of the retired /xhr/ncp endpoint.
+
+    def tearDown(self):
+        YfConfig.debug.hide_exceptions = True
+
     @staticmethod
-    def _fake_post(url, body=None, **kwargs):
+    def _story(uuid, url="https://finance.yahoo.com/news/story.html"):
+        return {
+            "__typename": "Story", "id": uuid, "title": f"Title {uuid}",
+            "contentAttributes": {
+                "description": None, "summary": f"Summary {uuid}",
+                "pubDate": "2026-10-09T13:25:39Z", "displayTime": "2026-10-09T13:25:39Z", "isHosted": True,
+                "canonicalUrl": url, "clickthroughUrl": url,
+                "provider": {"displayName": "Reuters", "url": "https://www.reuters.com/", "sourceId": "reuters.com"},
+                "thumbnail": None,
+            },
+            "finance": {"stockTickers": [{"symbol": "AAPL"}]},
+        }
+
+    @staticmethod
+    def _page(assets, end_cursor=None):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"data": {"lightyearList": {"main": {
+            "pageInfo": {"hasNextPage": end_cursor is not None, "endCursor": end_cursor},
+            "edges": [{"node": {"asset": asset}} for asset in assets],
+        }}}}
+        return response
+
+    def _news_with_mock(self, responses, **kwargs):
+        # Record each request's variables: get_news mutates one dict between pages.
+        requests = []
+
+        def fake_post(url, body=None, headers=None, **_):
+            requests.append({"url": url, "headers": headers, "variables": json.loads(json.dumps(body["variables"]))})
+            return responses.pop(0)
+
+        with patch("yfinance.data.YfData.post", side_effect=fake_post):
+            return yf.Ticker("AAPL").get_news(**kwargs), requests
+
+    @classmethod
+    def _fake_post(cls, url, body=None, **kwargs):
         variables = body["variables"]
         tab = variables["listInput"]["slug"].split("-")[-1]
-        edges = [{"node": {"asset": {"__typename": "Story", "id": f"{tab}-{i}",
-                                     "contentAttributes": {"canonicalUrl": "https://finance.yahoo.com/news/story.html"}}}}
-                 for i in range(variables["first"])]
-        page = {"pageInfo": {"hasNextPage": False}, "edges": edges}
-        return MagicMock(status_code=200, json=lambda: {"data": {"lightyearList": {"main": page}}})
+        return cls._page([cls._story(f"{tab}-{i}") for i in range(variables["first"])])
+
+    def test_news(self):
+        news = yf.Ticker("AAPL").get_news(count=5)
+        self.assertEqual(len(news), 5)
+        for item in news:
+            self.assertEqual(item["id"], item["content"]["id"])
+            self.assertTrue(item["content"]["title"])
+            self.assertTrue(item["content"]["summary"])
+            self.assertTrue(item["content"]["canonicalUrl"]["url"])
+
+    def test_news_press_releases(self):
+        news = yf.Ticker("AAPL").get_news(tab="press releases")
+        self.assertIsInstance(news, list)
+        for item in news:
+            self.assertTrue(item["content"]["title"])
+
+    def test_news_invalid_tab(self):
+        with self.assertRaises(ValueError):
+            yf.Ticker("AAPL").get_news(tab="bogus")
+
+    def test_news_item_shape(self):
+        news, requests = self._news_with_mock([self._page([self._story("a")])])
+        url = "https://finance.yahoo.com/news/story.html"
+        self.assertEqual(news, [{"id": "a", "content": {
+            "id": "a", "contentType": "STORY", "title": "Title a", "description": None, "summary": "Summary a",
+            "pubDate": "2026-10-09T13:25:39Z", "displayTime": "2026-10-09T13:25:39Z", "isHosted": True,
+            "provider": {"displayName": "Reuters", "url": "https://www.reuters.com/", "sourceId": "reuters.com"},
+            "canonicalUrl": {"url": url}, "clickThroughUrl": {"url": url}, "thumbnail": None,
+            "finance": {"stockTickers": [{"symbol": "AAPL"}]},
+        }}])
+        self.assertEqual(requests[0]["headers"], {"x-yahoo-cg-client-name": "finance"})
+        self.assertEqual(requests[0]["variables"]["listInput"]["slug"], "list=finance-US-en-US-ticker-news")
+        self.assertEqual(requests[0]["variables"]["listInput"]["queryVariables"]["tickerSymbol"], ["AAPL"])
+
+    def test_news_skips_unusable_assets(self):
+        assets = [{"__typename": "AssetError"}, None, {"__typename": "Outlink", "uuid": "x"},
+                  self._story("no-url", url=None), self._story("a")]
+        news, _ = self._news_with_mock([self._page(assets)])
+        self.assertEqual([item["id"] for item in news], ["a"])
+
+    def test_news_pages_until_count(self):
+        pages = [self._page([self._story("a"), {"__typename": "AssetError"}], end_cursor="c1"),
+                 self._page([self._story("b"), self._story("c")], end_cursor="c2")]
+        news, requests = self._news_with_mock(pages, count=3)
+        self.assertEqual([item["id"] for item in news], ["a", "b", "c"])
+        self.assertEqual([(r["variables"]["first"], r["variables"]["after"]) for r in requests],
+                         [(3, None), (2, "c1")])
+
+    def test_news_stops_at_end_of_list(self):
+        news, requests = self._news_with_mock([self._page([self._story("a")])], count=10)
+        self.assertEqual([item["id"] for item in news], ["a"])
+        self.assertEqual(len(requests), 1)
+
+    def test_news_http_error(self):
+        response = MagicMock()
+        response.status_code = 404
+        response.text = '{"message":"Not Found"}'
+
+        self.assertEqual(self._news_with_mock([response])[0], [])
+
+        YfConfig.debug.hide_exceptions = False
+        with self.assertRaises(YFDataException):
+            self._news_with_mock([response])
+
+    def test_news_graphql_error(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"data": {"lightyearList": None}, "errors": [{"message": "details redacted"}]}
+        response.text = json.dumps(response.json.return_value)
+
+        YfConfig.debug.hide_exceptions = False
+        with self.assertRaises(YFDataException):
+            self._news_with_mock([response])
 
     def test_news_cached_per_count_and_tab(self):
         with patch("yfinance.data.YfData.post", side_effect=self._fake_post):
@@ -1938,6 +2049,7 @@ def suite():
     suite.addTest(TestTickerFundsData('Test Funds Data'))
     suite.addTest(TestTickerValuationMeasures('Test valuation measures'))
     suite.addTest(TestTickerValuationMeasuresPeriods('Test valuation measures periods'))
+    suite.addTest(TestTickerNews('Test news'))
     return suite
 
 
