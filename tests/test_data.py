@@ -1,11 +1,15 @@
 """Tests for yfinance.data internal helpers."""
 import unittest
 from functools import lru_cache
+from unittest import mock
 
 from yfinance._http import new_session
+from yfinance.config import YfConfig
 from yfinance.data import SingletonMeta, YfData, _normalize_proxy, lru_cache_freezeargs
-from yfinance.exceptions import YFDataException
+from yfinance.exceptions import YFDataException, YFRateLimitError
 from yfinance.utils import frozendict
+
+_ISIN_LOOKUP_URL = "https://markets.businessinsider.com/ajax/SearchController_Suggest"
 
 
 class TestProxyConfig(unittest.TestCase):
@@ -167,6 +171,104 @@ class TestSetSessionCacheDetection(unittest.TestCase):
         session.cache = object()
         with self.assertRaises(YFDataException):
             self.data._set_session(session)
+
+
+class TestRequestAuthentication(unittest.TestCase):
+    def setUp(self):
+        singleton = mock.patch.dict(SingletonMeta._instances, clear=True)
+        singleton.start()
+        self.addCleanup(singleton.stop)
+        self.data = YfData()
+        self.addCleanup(self.data._session.close)
+
+    def test_non_finance_4xx_preserves_finance_authentication(self):
+        for status in (400, 401):
+            with self.subTest(status=status):
+                self.data._cookie_strategy = "csrf"
+                self.data._cookie = True
+                self.data._crumb = "finance-crumb"
+                self.data._session.cookies.update({"A3": "finance-cookie"})
+                response = mock.MagicMock(status_code=status, url=_ISIN_LOOKUP_URL)
+                with mock.patch.object(self.data, "_get_cookie_and_crumb", return_value=("finance-crumb", "csrf")) as auth, \
+                     mock.patch.object(self.data._session, "get", return_value=response) as get:
+                    result = self.data.get(_ISIN_LOOKUP_URL, params={"query": "AAPL"})
+
+                self.assertEqual(self.data._cookie_strategy, "csrf")
+                self.assertTrue(self.data._cookie)
+                self.assertEqual(self.data._crumb, "finance-crumb")
+                self.assertEqual(self.data._session.cookies.get("A3"), "finance-cookie")
+                self.assertIs(result, response)
+                auth.assert_not_called()
+                get.assert_called_once()
+                self.assertNotIn("crumb", get.call_args.kwargs["params"])
+
+    def test_non_finance_get_skips_crumb(self):
+        urls = (_ISIN_LOOKUP_URL,
+                "https://finance.yahoo.com.example.com/")
+        for url in urls:
+            with self.subTest(url=url):
+                response = mock.MagicMock(status_code=200, url=url)
+                params = {"query": "AAPL"}
+                with mock.patch.object(self.data, "_get_cookie_and_crumb", return_value=("finance-crumb", "basic")) as auth, \
+                     mock.patch.object(self.data._session, "get", return_value=response) as get:
+                    self.assertIs(self.data.get(url, params=params, timeout=7), response)
+                auth.assert_not_called()
+                get.assert_called_once_with(url=url, params={"query": "AAPL"}, timeout=7)
+                self.assertEqual(params, {"query": "AAPL"})
+
+    def test_finance_4xx_refreshes_crumb(self):
+        urls = ("https://finance.yahoo.com/",
+                "https://query1.finance.yahoo.com/v7/finance/quote",
+                "https://query2.finance.yahoo.com/v10/finance/quoteSummary/AAPL")
+        for url in urls:
+            with self.subTest(url=url):
+                self.data._cookie_strategy = "csrf"
+                response = mock.MagicMock(status_code=200)
+                params = {"symbol": "AAPL"}
+                with mock.patch.object(self.data, "_get_cookie_and_crumb",
+                                       side_effect=[("old-crumb", "csrf"), ("new-crumb", "basic")]) as auth, \
+                     mock.patch.object(self.data._session, "post",
+                                       side_effect=[mock.MagicMock(status_code=401), response]) as post:
+                    self.assertIs(self.data.post(url, params=params, timeout=7), response)
+                self.assertEqual(post.call_count, 2)
+                self.assertEqual(self.data._cookie_strategy, "basic")
+                auth.assert_has_calls([mock.call(30), mock.call(7)])
+                self.assertEqual(post.call_args.kwargs["params"]["crumb"], "new-crumb")
+                self.assertEqual(params, {"symbol": "AAPL"})
+
+    def test_non_finance_request_preserves_options(self):
+        response = mock.MagicMock(status_code=200)
+        body = {"query": "AAPL"}
+        params = {"example": "value"}
+        with mock.patch.dict(YfConfig.network.data, {"proxy": "http://proxy.example.com:8080"}), \
+             mock.patch.object(self.data, "_get_cookie_and_crumb") as auth, \
+             mock.patch.object(self.data._session, "post", return_value=response) as post:
+            self.assertIs(self.data.post(_ISIN_LOOKUP_URL, body=body, params=params, timeout=7), response)
+        auth.assert_not_called()
+        post.assert_called_once_with(url=_ISIN_LOOKUP_URL, json=body, params=params, timeout=7)
+        self.assertEqual(self.data._session.proxies,
+                         {"http": "http://proxy.example.com:8080", "https": "http://proxy.example.com:8080"})
+        self.assertEqual(params, {"example": "value"})
+
+    def test_non_finance_transport_error_retries(self):
+        response = mock.MagicMock(status_code=200, url=_ISIN_LOOKUP_URL)
+        with mock.patch.dict(YfConfig.network.data, {"retries": 1}), \
+             mock.patch("yfinance.data._time.sleep") as sleep, \
+             mock.patch.object(self.data, "_get_cookie_and_crumb") as auth, \
+             mock.patch.object(self.data._session, "get", side_effect=[TimeoutError("timed out"), response]) as get:
+            self.assertIs(self.data.get(_ISIN_LOOKUP_URL), response)
+        auth.assert_not_called()
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_non_finance_429_raises_without_cookie_retry(self):
+        response = mock.MagicMock(status_code=429, url=_ISIN_LOOKUP_URL)
+        with mock.patch.object(self.data, "_get_cookie_and_crumb") as auth, \
+             mock.patch.object(self.data._session, "get", return_value=response) as get:
+            with self.assertRaises(YFRateLimitError):
+                self.data.get(_ISIN_LOOKUP_URL)
+        auth.assert_not_called()
+        get.assert_called_once()
 
 
 if __name__ == "__main__":

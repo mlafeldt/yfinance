@@ -16,6 +16,12 @@ import threading
 from .exceptions import YFException, YFDataException, YFRateLimitError
 
 
+def _is_finance_url(url):
+    """Check if url is on a Finance host, the only ones using cookie/crumb auth."""
+    hostname = urlsplit(url).hostname or ''
+    return hostname == 'finance.yahoo.com' or hostname.endswith('.finance.yahoo.com')
+
+
 def _is_transient_error(exception):
     """Check if error is transient (network/timeout) and should be retried."""
     if isinstance(exception, (TimeoutError, socket.error, OSError)):
@@ -399,6 +405,21 @@ class YfData(metaclass=SingletonMeta):
             strategy = self._cookie_strategy
         return crumb, strategy
 
+    def _get_crumb_or_none(self, timeout=30):
+        # getcrumb may be rate-limited or unreachable while the target endpoint
+        # needs no crumb (e.g. chart API). Let the actual request decide.
+        try:
+            return self._get_cookie_and_crumb(timeout)
+        except YFRateLimitError:
+            utils.get_yf_logger().warning(
+                "Crumb fetch rate-limited (HTTP 429), continuing without crumb")
+        except Exception as e:
+            if not _is_transient_error(e):
+                raise
+            utils.get_yf_logger().warning(
+                f"Cookie/crumb fetch failed ({type(e).__name__}), continuing without crumb")
+        return None, self._cookie_strategy
+
     @utils.log_indent_decorator
     def get(self, url, params=None, timeout=30):
         response = self._make_request(url, request_method = self._session.get, params=params, timeout=timeout)
@@ -437,25 +458,11 @@ class YfData(metaclass=SingletonMeta):
         if 'crumb' in params:
             raise YFException("Don't manually add 'crumb' to params dict, let data.py handle it")
 
-        try:
-            crumb, strategy = self._get_cookie_and_crumb()
-        except YFRateLimitError:
-            # getcrumb is rate-limited but the target endpoint may not need
-            # a crumb (e.g. chart API). Let the actual request decide.
-            utils.get_yf_logger().warning(
-                "Crumb fetch rate-limited (HTTP 429), continuing without crumb")
-            crumb, strategy = None, self._cookie_strategy
-        except Exception as e:
-            if _is_transient_error(e):
-                utils.get_yf_logger().warning(
-                    f"Cookie/crumb fetch failed ({type(e).__name__}), continuing without crumb")
-                crumb, strategy = None, self._cookie_strategy
-            else:
-                raise
-        if crumb is not None:
-            crumbs = {'crumb': crumb}
-        else:
-            crumbs = {}
+        # Other services must not fetch a Finance crumb or change the shared
+        # cookie strategy.
+        is_finance_url = _is_finance_url(url)
+        crumb, strategy = self._get_crumb_or_none() if is_finance_url else (None, None)
+        crumbs = {'crumb': crumb} if crumb is not None else {}
 
         request_args = {
             'url': url,
@@ -480,30 +487,18 @@ class YfData(metaclass=SingletonMeta):
                 else:
                     raise
         utils.get_yf_logger().debug(f'response code={response.status_code}')
-        if response.status_code >= 400:
+        if is_finance_url and response.status_code >= 400:
             # Retry with other cookie strategy
-            try:
-                if strategy == 'basic':
-                    self._set_cookie_strategy('csrf')
-                else:
-                    self._set_cookie_strategy('basic')
-                crumb, strategy = self._get_cookie_and_crumb(timeout)
-            except YFRateLimitError:
-                crumb = None
-            except Exception as e:
-                if not _is_transient_error(e):
-                    raise
-                crumb = None
-            if 'crumb' in request_args['params']:
-                del request_args['params']['crumb']
-            if crumb is not None:
-                request_args['params']['crumb'] = crumb
+            self._set_cookie_strategy('csrf' if strategy == 'basic' else 'basic')
+            crumb, _ = self._get_crumb_or_none(timeout)
+            crumbs = {'crumb': crumb} if crumb is not None else {}
+            request_args['params'] = {**params, **crumbs}
             response = request_method(**request_args)
             utils.get_yf_logger().debug(f'response code={response.status_code}')
 
-            # Raise exception if rate limited
-            if response.status_code == 429:
-                raise YFRateLimitError()
+        # Rate limiting applies to every host, including those without crumbs.
+        if response.status_code == 429:
+            raise YFRateLimitError()
 
         return response
 
