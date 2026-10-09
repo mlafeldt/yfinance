@@ -1,6 +1,7 @@
 """Tests for yfinance.data internal helpers."""
 import unittest
 from functools import lru_cache
+from unittest import mock
 
 from yfinance._http import new_session
 from yfinance.data import SingletonMeta, YfData, _normalize_proxy, lru_cache_freezeargs
@@ -24,6 +25,36 @@ class TestProxyConfig(unittest.TestCase):
 
     def test_proxy_none_is_preserved(self):
         self.assertIsNone(_normalize_proxy(None))
+
+
+class TestRequestHeaders(unittest.TestCase):
+    def setUp(self):
+        singleton = mock.patch.dict(SingletonMeta._instances, clear=True)
+        singleton.start()
+        self.addCleanup(singleton.stop)
+        self.data = YfData()
+        self.addCleanup(self.data._session.close)
+
+    def _post_headers(self, **kwargs):
+        response = mock.MagicMock(status_code=200)
+        with mock.patch.object(self.data, "_get_cookie_and_crumb", return_value=(None, "basic")), \
+             mock.patch.object(self.data._session, "post", return_value=response) as post:
+            self.assertIs(self.data.post("https://query1.finance.yahoo.com/v1/test", **kwargs), response)
+        return post.call_args.kwargs.get("headers")
+
+    def test_post_without_headers_sends_none(self):
+        self.assertIsNone(self._post_headers(body={"query": "AAPL"}))
+
+    def test_post_sends_extra_headers(self):
+        headers = {"x-test": "1"}
+        self.assertEqual(self._post_headers(body={"query": "AAPL"}, headers=headers), {"x-test": "1"})
+        self.assertEqual(headers, {"x-test": "1"})
+
+    def test_post_merges_extra_headers_over_content_type(self):
+        self.assertEqual(self._post_headers(data='{"query": "AAPL"}', headers={"x-test": "1"}),
+                         {"Content-Type": "application/json", "x-test": "1"})
+        self.assertEqual(self._post_headers(data="AAPL", headers={"Content-Type": "text/plain"}),
+                         {"Content-Type": "text/plain"})
 
 
 class TestFrozenDict(unittest.TestCase):
